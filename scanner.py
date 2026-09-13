@@ -1,139 +1,245 @@
 import os
 import smtplib
+from io import StringIO
 from email.mime.text import MIMEText
 from email.header import Header
 from datetime import datetime
 
 import pandas as pd
 import yfinance as yf
+import requests
 
 
 # ============================================================
 # 1. 可调参数
 # ============================================================
 
-# 前高 A 左右各需要多少根K确认它是历史波峰
+# 历史波峰识别
 PIVOT_LEFT = 3
 PIVOT_RIGHT = 3
 
-# A 至少要是当时最近多少日内比较突出的高点
+# A必须是最近一段时间比较明显的高点
 A_CONTEXT_BARS = 30
 
-# A 后面至少回撤多少
+# A之后至少回撤多少
 MIN_PULLBACK_PCT = 8.0
 
-# A 与今天之间至少间隔多少个交易日
+# A距离今天至少多少个交易日
 MIN_DAYS_AFTER_A = 5
 
-# 最多往前寻找多少个交易日的 A
+# 最多寻找多少个交易日前的A
 MAX_DAYS_AFTER_A = 100
 
-# “再次冲击前高”的价格区间
+# 今天重新接近A的范围
 #
-# 例如：
-# A = 100
-# 下方6% -> 94
-# 上方8% -> 108
+# 例如A = 100：
+# 下方6% = 94
+# 上方8% = 108
 #
-# 今天的价格只要重新进入 94~108 这个区域，
-# 就属于“重新冲击前高”的候选。
+# 只要今天重新进入94~108，就进入候选范围
 RETEST_BELOW_PCT = 6.0
 RETEST_ABOVE_PCT = 8.0
 
-# 为了证明价格确实曾经离开过前高区域，
-# 回撤后至少要有多少天 high 低于前高区域下沿。
+# 中间必须真正离开过前高区域
+# 至少多少个交易日的最高价低于A区域下沿
 MIN_DAYS_AWAY = 3
 
-# A 之前多少天内至少要有一定的上涨推动
+# A之前的上涨推动
 IMPULSE_LOOKBACK = 15
 MIN_IMPULSE_PCT = 4.0
 
-# 下载多少历史数据
+# 下载历史数据长度
 DOWNLOAD_PERIOD = "1y"
 
 
 # ============================================================
-# 2. 获取 Nasdaq-100 股票列表
+# 2. 获取 Nasdaq-100 当前成分股
 # ============================================================
 
 def get_nasdaq100_symbols():
-    """
-    从 Wikipedia 自动读取 Nasdaq-100 当前成分股。
-    不需要你手工维护100只股票代码。
-    """
+
     url = "https://en.wikipedia.org/wiki/Nasdaq-100"
 
-    tables = pd.read_html(url)
+    # 模拟正常浏览器访问，避免Wikipedia返回403
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    tables = pd.read_html(
+        StringIO(response.text)
+    )
 
     for table in tables:
-        if "Ticker" in table.columns:
-            symbols = table["Ticker"].astype(str).tolist()
 
-            # Yahoo Finance 中 BRK.B 这类格式一般使用 BRK-B。
-            symbols = [s.replace(".", "-").strip() for s in symbols]
+        # 有时候网页表头可能是MultiIndex
+        if isinstance(table.columns, pd.MultiIndex):
+            table.columns = [
+                str(col[-1]).strip()
+                for col in table.columns
+            ]
+
+        columns = [
+            str(c).strip()
+            for c in table.columns
+        ]
+
+        table.columns = columns
+
+        # Wikipedia通常叫Ticker
+        if "Ticker" in table.columns:
+
+            symbols = (
+                table["Ticker"]
+                .astype(str)
+                .str.strip()
+                .tolist()
+            )
+
+            symbols = [
+                s.replace(".", "-")
+                for s in symbols
+            ]
 
             if len(symbols) >= 90:
+                print(
+                    f"Successfully loaded "
+                    f"{len(symbols)} Nasdaq-100 symbols."
+                )
                 return symbols
 
-    raise RuntimeError("无法从 Wikipedia 获取 Nasdaq-100 成分股列表。")
+        # 防止未来表头改成Symbol
+        if "Symbol" in table.columns:
+
+            symbols = (
+                table["Symbol"]
+                .astype(str)
+                .str.strip()
+                .tolist()
+            )
+
+            symbols = [
+                s.replace(".", "-")
+                for s in symbols
+            ]
+
+            if len(symbols) >= 90:
+                print(
+                    f"Successfully loaded "
+                    f"{len(symbols)} Nasdaq-100 symbols."
+                )
+                return symbols
+
+    raise RuntimeError(
+        "Nasdaq-100 component table was not found."
+    )
 
 
 # ============================================================
-# 3. 判断某一天是不是历史波峰 A
+# 3. 判断历史某根K是否为明确波峰
 # ============================================================
 
 def is_pivot_high(highs, i):
-    """
-    A 是历史波峰，因此允许使用它之后已经发生的几根K来确认。
-    这不会造成未来函数，因为扫描的是“今天”，A已经在历史中。
-    """
+
     if i < PIVOT_LEFT:
         return False
 
     if i + PIVOT_RIGHT >= len(highs):
         return False
 
-    center = highs.iloc[i]
+    center = float(highs.iloc[i])
 
-    left = highs.iloc[i - PIVOT_LEFT:i]
-    right = highs.iloc[i + 1:i + PIVOT_RIGHT + 1]
+    left = highs.iloc[
+        i - PIVOT_LEFT:i
+    ]
 
-    return center >= left.max() and center > right.max()
+    right = highs.iloc[
+        i + 1:i + PIVOT_RIGHT + 1
+    ]
+
+    if len(left) == 0 or len(right) == 0:
+        return False
+
+    return (
+        center >= float(left.max())
+        and
+        center > float(right.max())
+    )
 
 
 # ============================================================
-# 4. 判断 A 是否是相对明显的高点
+# 4. 判断A是不是比较明显的历史高点
 # ============================================================
 
 def is_major_high(df, i):
-    start = max(0, i - A_CONTEXT_BARS + 1)
 
-    context_high = df["High"].iloc[start:i + 1].max()
-    a_price = df["High"].iloc[i]
+    start = max(
+        0,
+        i - A_CONTEXT_BARS + 1
+    )
 
-    # A至少处于这段时间最高区域的2%以内
+    context_high = float(
+        df["High"]
+        .iloc[start:i + 1]
+        .max()
+    )
+
+    a_price = float(
+        df["High"].iloc[i]
+    )
+
+    # A至少位于近期最高区域2%以内
     if a_price < context_high * 0.98:
         return False
 
-    # A以前应该有一定上涨推动
-    impulse_start = max(0, i - IMPULSE_LOOKBACK)
+    # 检查A之前是否存在一定上涨推动
+    impulse_start = max(
+        0,
+        i - IMPULSE_LOOKBACK
+    )
 
-    impulse_low = df["Low"].iloc[impulse_start:i + 1].min()
+    impulse_low = float(
+        df["Low"]
+        .iloc[impulse_start:i + 1]
+        .min()
+    )
 
     if impulse_low <= 0:
         return False
 
-    impulse_pct = (a_price - impulse_low) / impulse_low * 100
+    impulse_pct = (
+        (a_price - impulse_low)
+        / impulse_low
+        * 100
+    )
 
-    return impulse_pct >= MIN_IMPULSE_PCT
+    if impulse_pct < MIN_IMPULSE_PCT:
+        return False
+
+    return True
 
 
 # ============================================================
-# 5. 检查一只股票今天是否“再次冲击前高”
+# 5. 扫描一只股票
 # ============================================================
 
 def scan_symbol(symbol):
+
     try:
+
         df = yf.download(
             symbol,
             period=DOWNLOAD_PERIOD,
@@ -144,14 +250,41 @@ def scan_symbol(symbol):
         )
 
         if df is None or len(df) < 60:
+            print(
+                f"[SKIP] {symbol}: "
+                f"Not enough data."
+            )
             return None
 
-        # yfinance 某些版本会产生 MultiIndex
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        # 兼容yfinance新版MultiIndex
+        if isinstance(
+            df.columns,
+            pd.MultiIndex
+        ):
+
+            df.columns = (
+                df.columns
+                .get_level_values(0)
+            )
+
+        required_columns = [
+            "Open",
+            "High",
+            "Low",
+            "Close"
+        ]
+
+        for col in required_columns:
+
+            if col not in df.columns:
+                print(
+                    f"[SKIP] {symbol}: "
+                    f"Missing {col}."
+                )
+                return None
 
         df = df.dropna(
-            subset=["Open", "High", "Low", "Close"]
+            subset=required_columns
         ).copy()
 
         if len(df) < 60:
@@ -159,68 +292,104 @@ def scan_symbol(symbol):
 
         today_i = len(df) - 1
 
-        today_high = float(df["High"].iloc[today_i])
-        today_low = float(df["Low"].iloc[today_i])
-        today_close = float(df["Close"].iloc[today_i])
+        today_high = float(
+            df["High"].iloc[today_i]
+        )
 
-        # --------------------------------------------
-        # 从距离今天较近的历史波峰开始向前寻找
-        #
-        # 我们寻找的是：
-        #
-        # A
-        # ↓
-        # 明显回撤
-        # ↓
-        # 今天第一次重新进入A附近
-        # --------------------------------------------
+        today_low = float(
+            df["Low"].iloc[today_i]
+        )
+
+        today_close = float(
+            df["Close"].iloc[today_i]
+        )
+
+        today_date = df.index[today_i]
+
+        # ====================================================
+        # 寻找历史主波峰A
+        # ====================================================
 
         earliest_a = max(
             PIVOT_LEFT,
             today_i - MAX_DAYS_AFTER_A
         )
 
-        latest_a = today_i - MIN_DAYS_AFTER_A
+        latest_a = (
+            today_i -
+            MIN_DAYS_AFTER_A
+        )
 
         if latest_a <= earliest_a:
             return None
 
         candidate_indices = list(
-            range(earliest_a, latest_a + 1)
+            range(
+                earliest_a,
+                latest_a + 1
+            )
         )
 
-        # 最近的合格A优先
+        # 优先检查距离今天最近的有效A
         candidate_indices.reverse()
 
         for a_i in candidate_indices:
 
-            # ----------------------------------------
-            # A必须是历史明确波峰
-            # ----------------------------------------
-            if not is_pivot_high(df["High"], a_i):
+            # --------------------------------------------
+            # A首先必须是一个历史波峰
+            # --------------------------------------------
+
+            if not is_pivot_high(
+                df["High"],
+                a_i
+            ):
                 continue
 
-            if not is_major_high(df, a_i):
+            # --------------------------------------------
+            # A还必须是一个相对明显的高点
+            # --------------------------------------------
+
+            if not is_major_high(
+                df,
+                a_i
+            ):
                 continue
 
-            a_price = float(df["High"].iloc[a_i])
+            a_price = float(
+                df["High"].iloc[a_i]
+            )
 
             if a_price <= 0:
                 continue
 
-            # ----------------------------------------
-            # A以后，到昨天为止
-            #
-            # 今天不能参与决定“过去有没有回撤”，
-            # 防止逻辑混乱。
-            # ----------------------------------------
-            after_a = df.iloc[a_i + 1:today_i]
+            a_date = df.index[a_i]
 
-            if len(after_a) < MIN_DAYS_AFTER_A - 1:
+            # --------------------------------------------
+            # A以后到昨天
+            #
+            # 今天不参与历史回撤的计算
+            # --------------------------------------------
+
+            after_a = df.iloc[
+                a_i + 1:
+                today_i
+            ]
+
+            if len(after_a) < 3:
                 continue
 
-            c_price = float(after_a["Low"].min())
-            c_date = after_a["Low"].idxmin()
+            # --------------------------------------------
+            # 找A以后最深回撤C
+            # --------------------------------------------
+
+            c_price = float(
+                after_a["Low"].min()
+            )
+
+            c_date = (
+                after_a["Low"]
+                .idxmin()
+            )
 
             pullback_pct = (
                 (a_price - c_price)
@@ -228,83 +397,117 @@ def scan_symbol(symbol):
                 * 100
             )
 
-            # ----------------------------------------
-            # 中间必须真正发生明显回撤
-            # ----------------------------------------
-            if pullback_pct < MIN_PULLBACK_PCT:
+            # --------------------------------------------
+            # 中间回撤至少8%
+            # --------------------------------------------
+
+            if (
+                pullback_pct
+                < MIN_PULLBACK_PCT
+            ):
                 continue
 
-            # ----------------------------------------
-            # 定义A附近的“再次冲击区”
-            # ----------------------------------------
+            # --------------------------------------------
+            # 定义重新冲击前高区域
+            # --------------------------------------------
+
             lower_band = (
-                a_price *
-                (1 - RETEST_BELOW_PCT / 100)
+                a_price
+                *
+                (
+                    1
+                    -
+                    RETEST_BELOW_PCT
+                    / 100
+                )
             )
 
             upper_band = (
-                a_price *
-                (1 + RETEST_ABOVE_PCT / 100)
+                a_price
+                *
+                (
+                    1
+                    +
+                    RETEST_ABOVE_PCT
+                    / 100
+                )
             )
 
-            # ----------------------------------------
-            # 必须真的离开过A附近
+            # --------------------------------------------
+            # 中间必须真正离开A附近
             #
-            # 至少若干天的最高价都低于下沿，
-            # 避免高位横盘被误认为“再次冲击”。
-            # ----------------------------------------
-            away_days = (
-                after_a["High"] < lower_band
-            ).sum()
+            # 至少有MIN_DAYS_AWAY天
+            # 最高价都低于A区域下沿
+            # --------------------------------------------
+
+            away_days = int(
+                (
+                    after_a["High"]
+                    < lower_band
+                ).sum()
+            )
 
             if away_days < MIN_DAYS_AWAY:
                 continue
 
-            # ----------------------------------------
-            # 今天必须进入A附近区域
+            # --------------------------------------------
+            # 今天重新进入前高A附近
             #
-            # 使用整根K的价格范围是否与区域相交，
-            # 这样跳空上涨也能识别。
-            # ----------------------------------------
+            # 使用整根K是否与A区域相交
+            #
+            # 可以识别普通上涨和跳空上涨
+            # --------------------------------------------
+
             today_enters_zone = (
                 today_high >= lower_band
-                and today_low <= upper_band
+                and
+                today_low <= upper_band
             )
 
             if not today_enters_zone:
                 continue
 
-            # ----------------------------------------
-            # 关键：
-            # 今天应该是“重新进入”的第一天。
+            # --------------------------------------------
+            # 昨天不能已经在这个区域
             #
-            # 如果昨天已经在A附近，
-            # 今天就不重复提醒。
-            # ----------------------------------------
+            # 我们希望尽量在“首次重新进入”时提醒
+            # --------------------------------------------
+
             yesterday_high = float(
-                df["High"].iloc[today_i - 1]
+                df["High"]
+                .iloc[today_i - 1]
             )
 
             yesterday_low = float(
-                df["Low"].iloc[today_i - 1]
+                df["Low"]
+                .iloc[today_i - 1]
             )
 
             yesterday_in_zone = (
-                yesterday_high >= lower_band
-                and yesterday_low <= upper_band
+                yesterday_high
+                >= lower_band
+                and
+                yesterday_low
+                <= upper_band
             )
 
             if yesterday_in_zone:
                 continue
 
-            # ----------------------------------------
-            # 最好是从下方向上重新攻击
-            #
-            # 如果昨天已经明显高于整个A区，
-            # 就不是我们要的“从下方重新冲击”。
-            # ----------------------------------------
-            if yesterday_high > upper_band:
+            # --------------------------------------------
+            # 如果昨天已经完全突破A区域上方，
+            # 今天就不是从下方重新冲击
+            # --------------------------------------------
+
+            if (
+                yesterday_high
+                > upper_band
+            ):
                 continue
+
+            # --------------------------------------------
+            # 今天最高价距离A多少
+            # --------------------------------------------
 
             distance_pct = (
                 (today_high - a_price)
@@ -312,29 +515,77 @@ def scan_symbol(symbol):
                 * 100
             )
 
-            a_date = df.index[a_i]
+            bars_from_a = (
+                today_i - a_i
+            )
 
-            bars_from_a = today_i - a_i
+            print(
+                f"[MATCH] {symbol} | "
+                f"A={a_price:.2f} | "
+                f"Pullback={pullback_pct:.2f}% | "
+                f"TodayHigh={today_high:.2f} | "
+                f"Distance={distance_pct:+.2f}%"
+            )
 
             return {
                 "symbol": symbol,
-                "a_date": str(a_date.date()),
-                "a_price": a_price,
-                "c_date": str(c_date.date()),
-                "c_price": c_price,
-                "pullback_pct": pullback_pct,
-                "today_high": today_high,
-                "today_close": today_close,
-                "distance_pct": distance_pct,
-                "bars_from_a": bars_from_a,
-                "zone_low": lower_band,
-                "zone_high": upper_band,
+
+                "today_date":
+                    str(
+                        today_date.date()
+                    ),
+
+                "a_date":
+                    str(
+                        a_date.date()
+                    ),
+
+                "a_price":
+                    a_price,
+
+                "c_date":
+                    str(
+                        c_date.date()
+                    ),
+
+                "c_price":
+                    c_price,
+
+                "pullback_pct":
+                    pullback_pct,
+
+                "today_high":
+                    today_high,
+
+                "today_close":
+                    today_close,
+
+                "distance_pct":
+                    distance_pct,
+
+                "bars_from_a":
+                    bars_from_a,
+
+                "zone_low":
+                    lower_band,
+
+                "zone_high":
+                    upper_band,
+
+                "away_days":
+                    away_days,
             }
 
         return None
 
     except Exception as exc:
-        print(f"[ERROR] {symbol}: {exc}")
+
+        print(
+            f"[ERROR] {symbol}: "
+            f"{type(exc).__name__}: "
+            f"{exc}"
+        )
+
         return None
 
 
@@ -343,35 +594,65 @@ def scan_symbol(symbol):
 # ============================================================
 
 def run_scan():
-    symbols = get_nasdaq100_symbols()
 
-    print(f"Nasdaq-100 symbols: {len(symbols)}")
+    symbols = (
+        get_nasdaq100_symbols()
+    )
+
+    print("")
+    print(
+        "================================"
+    )
+
+    print(
+        f"Nasdaq-100 symbols: "
+        f"{len(symbols)}"
+    )
+
+    print(
+        "================================"
+    )
 
     results = []
 
-    for idx, symbol in enumerate(symbols, start=1):
+    for index, symbol in enumerate(
+        symbols,
+        start=1
+    ):
 
         print(
-            f"[{idx}/{len(symbols)}] "
+            f"[{index}/{len(symbols)}] "
             f"Scanning {symbol}..."
         )
 
-        result = scan_symbol(symbol)
+        result = scan_symbol(
+            symbol
+        )
 
         if result is not None:
-            results.append(result)
+            results.append(
+                result
+            )
 
     return results
 
 
 # ============================================================
-# 7. 生成邮件
+# 7. 生成邮件正文
 # ============================================================
 
 def build_email(results):
-    today = datetime.now().strftime("%Y-%m-%d")
+
+    today = datetime.now().strftime(
+        "%Y-%m-%d"
+    )
+
+    # ========================================================
+    # 今天没有候选
+    # ========================================================
 
     if not results:
+
         subject = (
             f"Nasdaq-100 前高再次冲击扫描 "
             f"{today}：无候选"
@@ -379,35 +660,57 @@ def build_email(results):
 
         body = (
             f"{today}\n\n"
-            "今天 Nasdaq-100 没有发现符合条件的"
-            "“明显回撤后再次冲击前高”股票。\n"
+            "今天 Nasdaq-100 没有发现符合"
+            "“明显回撤后再次冲击前高”"
+            "价格结构的股票。\n\n"
+            "当前主要筛选条件：\n"
+            f"1. 中间回撤 >= "
+            f"{MIN_PULLBACK_PCT:.1f}%\n"
+            f"2. 前高区域下方容差 "
+            f"{RETEST_BELOW_PCT:.1f}%\n"
+            f"3. 前高区域上方容差 "
+            f"{RETEST_ABOVE_PCT:.1f}%\n"
+            f"4. 至少离开前高区域 "
+            f"{MIN_DAYS_AWAY} 个交易日\n"
         )
 
         return subject, body
 
+    # ========================================================
+    # 有候选
+    # ========================================================
+
     results = sorted(
         results,
-        key=lambda x: abs(x["distance_pct"])
+        key=lambda x:
+        abs(x["distance_pct"])
     )
 
     subject = (
         f"Nasdaq-100 前高再次冲击提醒 "
-        f"{today}：{len(results)} 只"
+        f"{today}："
+        f"{len(results)} 只"
     )
 
     lines = []
 
     lines.append(
-        f"{today} Nasdaq-100 扫描结果"
+        f"{today} Nasdaq-100 "
+        f"前高再次冲击扫描结果"
     )
 
     lines.append("")
-    lines.append(
-        "以下股票今天重新进入历史主波峰附近。"
-    )
 
     lines.append(
-        "本扫描只做价格结构初筛，不代表买卖建议。"
+        "以下股票在经历明显回撤后，"
+        "今天重新进入历史主波峰附近。"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "这只是价格结构初筛，"
+        "需要你再打开图表人工判断。"
     )
 
     lines.append("")
@@ -423,86 +726,153 @@ def build_email(results):
         )
 
         lines.append(
-            f"前高 A 日期：{r['a_date']}"
-        )
-
-        lines.append(
-            f"前高 A：{r['a_price']:.2f}"
-        )
-
-        lines.append(
-            f"中间最低 C 日期：{r['c_date']}"
-        )
-
-        lines.append(
-            f"中间最低 C：{r['c_price']:.2f}"
-        )
-
-        lines.append(
-            f"A→C 最大回撤："
-            f"{r['pullback_pct']:.2f}%"
-        )
-
-        lines.append(
-            f"今天最高价：{r['today_high']:.2f}"
-        )
-
-        lines.append(
-            f"今天收盘价：{r['today_close']:.2f}"
-        )
-
-        lines.append(
-            f"今天最高价相对A："
-            f"{r['distance_pct']:+.2f}%"
-        )
-
-        lines.append(
-            f"前高附近区域："
-            f"{r['zone_low']:.2f} ~ "
-            f"{r['zone_high']:.2f}"
-        )
-
-        lines.append(
-            f"A距今天：{r['bars_from_a']} 根日K"
+            f"最新交易日："
+            f"{r['today_date']}"
         )
 
         lines.append("")
 
-    return subject, "\n".join(lines)
+        lines.append(
+            f"历史前高 A 日期："
+            f"{r['a_date']}"
+        )
 
+        lines.append(
+            f"历史前高 A："
+            f"{r['a_price']:.2f}"
+        )
 
-# ============================================================
-# 8. 发邮件
-# ============================================================
+        lines.append("")
 
-def send_email(subject, body):
-    smtp_host = os.getenv("SMTP_HOST")
-    smtp_port = int(
-        os.getenv("SMTP_PORT", "465")
+        lines.append(
+            f"中间最低点 C 日期："
+            f"{r['c_date']}"
+        )
+
+        lines.append(
+            f"中间最低点 C："
+            f"{r['c_price']:.2f}"
+        )
+
+        lines.append(
+            f"A → C 最大回撤："
+            f"{r['pullback_pct']:.2f}%"
+        )
+
+        lines.append("")
+
+        lines.append(
+            f"今天最高价："
+            f"{r['today_high']:.2f}"
+        )
+
+        lines.append(
+            f"今天收盘价："
+            f"{r['today_close']:.2f}"
+        )
+
+        lines.append(
+            f"今天最高价相对前高A："
+            f"{r['distance_pct']:+.2f}%"
+        )
+
+        lines.append("")
+
+        lines.append(
+            f"当前前高观察区域："
+            f"{r['zone_low']:.2f}"
+            f" ~ "
+            f"{r['zone_high']:.2f}"
+        )
+
+        lines.append(
+            f"A距今天："
+            f"{r['bars_from_a']} 根日K"
+        )
+
+        lines.append(
+            f"中间明显离开前高区域："
+            f"{r['away_days']} 天"
+        )
+
+        lines.append("")
+
+    return (
+        subject,
+        "\n".join(lines)
     )
 
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASS")
-    email_to = os.getenv("EMAIL_TO")
+
+# ============================================================
+# 8. 发送QQ邮箱提醒
+# ============================================================
+
+def send_email(
+    subject,
+    body
+):
+
+    smtp_host = os.getenv(
+        "SMTP_HOST"
+    )
+
+    smtp_port_text = os.getenv(
+        "SMTP_PORT",
+        "465"
+    )
+
+    smtp_user = os.getenv(
+        "SMTP_USER"
+    )
+
+    smtp_pass = os.getenv(
+        "SMTP_PASS"
+    )
+
+    email_to = os.getenv(
+        "EMAIL_TO"
+    )
 
     missing = []
 
     if not smtp_host:
-        missing.append("SMTP_HOST")
+        missing.append(
+            "SMTP_HOST"
+        )
 
     if not smtp_user:
-        missing.append("SMTP_USER")
+        missing.append(
+            "SMTP_USER"
+        )
 
     if not smtp_pass:
-        missing.append("SMTP_PASS")
+        missing.append(
+            "SMTP_PASS"
+        )
 
     if not email_to:
-        missing.append("EMAIL_TO")
+        missing.append(
+            "EMAIL_TO"
+        )
 
     if missing:
+
         raise RuntimeError(
-            "缺少 GitHub Secrets: "
-            + ", ".join(missing)
+            "Missing GitHub Secrets: "
+            +
+            ", ".join(missing)
+        )
+
+    try:
+        smtp_port = int(
+            smtp_port_text
+        )
+
+    except ValueError:
+
+        raise RuntimeError(
+            "SMTP_PORT must be "
+            "a number."
         )
 
     msg = MIMEText(
@@ -519,7 +889,12 @@ def send_email(subject, body):
     msg["From"] = smtp_user
     msg["To"] = email_to
 
-    # 465通常使用SSL
+    print("")
+    print(
+        "Connecting to SMTP server..."
+    )
+
+    # QQ邮箱465端口
     if smtp_port == 465:
 
         with smtplib.SMTP_SSL(
@@ -539,7 +914,7 @@ def send_email(subject, body):
                 msg.as_string()
             )
 
-    # 587通常使用STARTTLS
+    # 如果以后改用587
     else:
 
         with smtplib.SMTP(
@@ -548,7 +923,9 @@ def send_email(subject, body):
             timeout=30
         ) as server:
 
+            server.ehlo()
             server.starttls()
+            server.ehlo()
 
             server.login(
                 smtp_user,
@@ -560,6 +937,10 @@ def send_email(subject, body):
                 [email_to],
                 msg.as_string()
             )
+
+    print(
+        "Email sent successfully."
+    )
 
 
 # ============================================================
@@ -573,27 +954,50 @@ if __name__ == "__main__":
         "retest scanner..."
     )
 
+    print("")
+
     results = run_scan()
 
     print("")
     print(
-        f"Found {len(results)} candidate(s)."
+        "================================"
     )
 
-    for r in results:
-        print(
-            r["symbol"],
-            f"A={r['a_price']:.2f}",
-            f"Pullback={r['pullback_pct']:.2f}%",
-            f"TodayHigh={r['today_high']:.2f}",
-            f"Distance={r['distance_pct']:+.2f}%"
-        )
+    print(
+        f"Found "
+        f"{len(results)} "
+        f"candidate(s)."
+    )
 
-    subject, body = build_email(results)
+    print(
+        "================================"
+    )
+
+    if results:
+
+        for r in results:
+
+            print(
+                r["symbol"],
+                f"| A={r['a_price']:.2f}",
+                f"| Pullback="
+                f"{r['pullback_pct']:.2f}%",
+                f"| TodayHigh="
+                f"{r['today_high']:.2f}",
+                f"| Distance="
+                f"{r['distance_pct']:+.2f}%"
+            )
+
+    subject, body = (
+        build_email(results)
+    )
 
     send_email(
         subject,
         body
     )
 
-    print("Email sent successfully.")
+    print("")
+    print(
+        "Scanner finished successfully."
+    )
