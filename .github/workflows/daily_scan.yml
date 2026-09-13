@@ -15,16 +15,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check New York time
+      - name: Check whether scanner should run
         id: market_time
         run: |
-          NY_HOUR=$(TZ=America/New_York date +%H)
+          # 如果是你手动点击 Run workflow
+          # 无论当前几点，都直接运行
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual run detected."
+            echo "run_scan=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          echo "Current New York hour: $NY_HOUR"
+          # 如果是自动定时任务
+          # 只允许纽约当地下午3点这一小时运行
+          NY_HOUR=$(TZ=America/New_York date +%H)
+          NY_TIME=$(TZ=America/New_York date '+%Y-%m-%d %H:%M:%S')
+
+          echo "Current New York time: $NY_TIME"
 
           if [ "$NY_HOUR" = "15" ]; then
+            echo "Correct market time. Scanner will run."
             echo "run_scan=true" >> "$GITHUB_OUTPUT"
           else
+            echo "Not the correct market time. Scanner skipped."
             echo "run_scan=false" >> "$GITHUB_OUTPUT"
           fi
 
