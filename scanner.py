@@ -1,176 +1,245 @@
 import os
 import smtplib
-from io import StringIO
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.header import Header
-from datetime import datetime
 
 import pandas as pd
 import yfinance as yf
-import requests
 
 
 # ============================================================
-# 1. 可调参数
+# 1. 当前 Nasdaq-100 股票池
+#
+# Nasdaq-100 是100家公司。
+# 因部分公司存在多个股票类别，因此证券代码可能超过100个。
+#
+# 后续指数换股时，只需要更新这里。
 # ============================================================
 
-# 历史波峰识别
+NASDAQ100_SYMBOLS = [
+    "AAPL",
+    "APP",
+    "TTWO",
+    "ADSK",
+    "CMCSA",
+    "PYPL",
+    "ISRG",
+    "DASH",
+    "MELI",
+    "HONA",
+    "NXPI",
+    "CSX",
+    "FANG",
+    "WBD",
+    "FTNT",
+    "PANW",
+    "SNPS",
+    "ADP",
+    "DXCM",
+    "GOOG",
+    "GOOGL",
+    "MNST",
+    "PCAR",
+    "BKNG",
+    "CRWD",
+    "FAST",
+    "SPCX",
+    "PAYX",
+    "QCOM",
+    "MSFT",
+    "CDNS",
+    "ROST",
+    "MDLZ",
+    "COST",
+    "NFLX",
+    "PEP",
+    "WMT",
+    "TMUS",
+    "SHOP",
+    "AMZN",
+    "INTU",
+    "ROP",
+    "WDAY",
+    "GILD",
+    "ORLY",
+    "EXC",
+    "MAR",
+    "ODFL",
+    "CTAS",
+    "SBUX",
+    "KHC",
+    "CCEP",
+    "AEP",
+    "AVGO",
+    "PDD",
+    "XEL",
+    "ADI",
+    "TXN",
+    "LIN",
+    "TSLA",
+    "ABNB",
+    "VRTX",
+    "TRI",
+    "HON",
+    "META",
+    "GEHC",
+    "MPWR",
+    "DDOG",
+    "IDXX",
+    "RKLB",
+    "REGN",
+    "CSCO",
+    "FER",
+    "KDP",
+    "MCHP",
+    "PLTR",
+    "AMGN",
+    "AXON",
+    "ADBE",
+    "NVDA",
+    "ASML",
+    "STX",
+    "CEG",
+    "MSTR",
+    "KLAC",
+    "AMAT",
+    "AMD",
+    "TER",
+    "ALNY",
+    "MRVL",
+    "ARM",
+    "CPRT",
+    "SNDK",
+    "WDC",
+    "MU",
+    "NBIS",
+    "ALAB",
+    "LITE",
+    "INTC",
+    "LRCX",
+    "CRWV",
+    "BKR",
+]
+
+
+# ============================================================
+# 2. 可调参数
+# ============================================================
+
+# ------------------------------------------------------------
+# 历史前高 A 的初步识别
+# ------------------------------------------------------------
+
 PIVOT_LEFT = 3
 PIVOT_RIGHT = 3
 
-# A必须是最近一段时间比较明显的高点
+# A必须在最近多少根K中属于明显高位
 A_CONTEXT_BARS = 30
 
-# A之后至少回撤多少
+# A允许距离这段时间最高价多少
+# 2 = A只要在近期最高价2%以内
+A_EXTREME_TOLERANCE_PCT = 2.0
+
+
+# ------------------------------------------------------------
+# A之前需要有一定上涨推动
+# ------------------------------------------------------------
+
+IMPULSE_LOOKBACK = 15
+
+MIN_IMPULSE_PCT = 4.0
+
+
+# ------------------------------------------------------------
+# A -> C 回撤
+#
+# 这是目前很重要的参数。
+# 默认要求从A至少回撤8%。
+# ------------------------------------------------------------
+
 MIN_PULLBACK_PCT = 8.0
 
-# A距离今天至少多少个交易日
-MIN_DAYS_AFTER_A = 5
 
-# 最多寻找多少个交易日前的A
-MAX_DAYS_AFTER_A = 100
-
-# 今天重新接近A的范围
+# ------------------------------------------------------------
+# “真正离开前高”
 #
-# 例如A = 100：
+# A锁定不仅要求跌8%，
+# 还要求至少有若干天的最高价低于前高区域下沿。
+#
+# 这样尽量排除高位横盘。
+# ------------------------------------------------------------
+
+MIN_DAYS_AWAY = 3
+
+
+# ------------------------------------------------------------
+# “再次冲击前高”的价格区域
+#
+# 例如：
+#
+# A = 100
+#
 # 下方6% = 94
 # 上方8% = 108
 #
-# 只要今天重新进入94~108，就进入候选范围
+# 当前K线重新进入94~108区域时，
+# 就认为正在重新攻击历史前高。
+#
+# 这是目前为了保证正例不漏掉而设置得比较宽。
+# ------------------------------------------------------------
+
 RETEST_BELOW_PCT = 6.0
+
 RETEST_ABOVE_PCT = 8.0
 
-# 中间必须真正离开过前高区域
-# 至少多少个交易日的最高价低于A区域下沿
-MIN_DAYS_AWAY = 3
 
-# A之前的上涨推动
-IMPULSE_LOOKBACK = 15
-MIN_IMPULSE_PCT = 4.0
+# ------------------------------------------------------------
+# A 与今天之间的时间
+# ------------------------------------------------------------
 
-# 下载历史数据长度
+MIN_DAYS_AFTER_A = 5
+
+MAX_DAYS_AFTER_A = 120
+
+
+# ------------------------------------------------------------
+# 下载历史数据
+# ------------------------------------------------------------
+
 DOWNLOAD_PERIOD = "1y"
 
 
 # ============================================================
-# 2. 获取 Nasdaq-100 当前成分股
+# 3. 判断某根历史K是不是初步波峰
 # ============================================================
 
-def get_nasdaq100_symbols():
-
-    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-
-    # 模拟正常浏览器访问，避免Wikipedia返回403
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    tables = pd.read_html(
-        StringIO(response.text)
-    )
-
-    for table in tables:
-
-        # 有时候网页表头可能是MultiIndex
-        if isinstance(table.columns, pd.MultiIndex):
-            table.columns = [
-                str(col[-1]).strip()
-                for col in table.columns
-            ]
-
-        columns = [
-            str(c).strip()
-            for c in table.columns
-        ]
-
-        table.columns = columns
-
-        # Wikipedia通常叫Ticker
-        if "Ticker" in table.columns:
-
-            symbols = (
-                table["Ticker"]
-                .astype(str)
-                .str.strip()
-                .tolist()
-            )
-
-            symbols = [
-                s.replace(".", "-")
-                for s in symbols
-            ]
-
-            if len(symbols) >= 90:
-                print(
-                    f"Successfully loaded "
-                    f"{len(symbols)} Nasdaq-100 symbols."
-                )
-                return symbols
-
-        # 防止未来表头改成Symbol
-        if "Symbol" in table.columns:
-
-            symbols = (
-                table["Symbol"]
-                .astype(str)
-                .str.strip()
-                .tolist()
-            )
-
-            symbols = [
-                s.replace(".", "-")
-                for s in symbols
-            ]
-
-            if len(symbols) >= 90:
-                print(
-                    f"Successfully loaded "
-                    f"{len(symbols)} Nasdaq-100 symbols."
-                )
-                return symbols
-
-    raise RuntimeError(
-        "Nasdaq-100 component table was not found."
-    )
-
-
-# ============================================================
-# 3. 判断历史某根K是否为明确波峰
-# ============================================================
-
-def is_pivot_high(highs, i):
+def is_pivot_high(df, i):
 
     if i < PIVOT_LEFT:
         return False
 
-    if i + PIVOT_RIGHT >= len(highs):
+    if i + PIVOT_RIGHT >= len(df):
         return False
 
-    center = float(highs.iloc[i])
+    center = float(
+        df["High"].iloc[i]
+    )
 
-    left = highs.iloc[
-        i - PIVOT_LEFT:i
+    left = df["High"].iloc[
+        i - PIVOT_LEFT:
+        i
     ]
 
-    right = highs.iloc[
-        i + 1:i + PIVOT_RIGHT + 1
+    right = df["High"].iloc[
+        i + 1:
+        i + PIVOT_RIGHT + 1
     ]
 
-    if len(left) == 0 or len(right) == 0:
+    if len(left) < PIVOT_LEFT:
+        return False
+
+    if len(right) < PIVOT_RIGHT:
         return False
 
     return (
@@ -181,31 +250,48 @@ def is_pivot_high(highs, i):
 
 
 # ============================================================
-# 4. 判断A是不是比较明显的历史高点
+# 4. 判断这个波峰够不够明显
 # ============================================================
 
 def is_major_high(df, i):
 
-    start = max(
+    a_price = float(
+        df["High"].iloc[i]
+    )
+
+    # --------------------------------------------------------
+    # 近期高点
+    # --------------------------------------------------------
+
+    context_start = max(
         0,
         i - A_CONTEXT_BARS + 1
     )
 
     context_high = float(
         df["High"]
-        .iloc[start:i + 1]
+        .iloc[context_start:i + 1]
         .max()
     )
 
-    a_price = float(
-        df["High"].iloc[i]
+    minimum_allowed = (
+        context_high
+        *
+        (
+            1
+            -
+            A_EXTREME_TOLERANCE_PCT
+            / 100
+        )
     )
 
-    # A至少位于近期最高区域2%以内
-    if a_price < context_high * 0.98:
+    if a_price < minimum_allowed:
         return False
 
-    # 检查A之前是否存在一定上涨推动
+    # --------------------------------------------------------
+    # A之前要有一定上涨推动
+    # --------------------------------------------------------
+
     impulse_start = max(
         0,
         i - IMPULSE_LOOKBACK
@@ -222,8 +308,10 @@ def is_major_high(df, i):
 
     impulse_pct = (
         (a_price - impulse_low)
-        / impulse_low
-        * 100
+        /
+        impulse_low
+        *
+        100
     )
 
     if impulse_pct < MIN_IMPULSE_PCT:
@@ -233,7 +321,78 @@ def is_major_high(df, i):
 
 
 # ============================================================
-# 5. 扫描一只股票
+# 5. 清洗 yfinance 数据
+# ============================================================
+
+def clean_dataframe(df):
+
+    if df is None:
+        return None
+
+    if len(df) == 0:
+        return None
+
+    # --------------------------------------------------------
+    # yfinance 某些情况下返回 MultiIndex
+    # --------------------------------------------------------
+
+    if isinstance(
+        df.columns,
+        pd.MultiIndex
+    ):
+
+        df.columns = (
+            df.columns
+            .get_level_values(0)
+        )
+
+    needed = [
+        "Open",
+        "High",
+        "Low",
+        "Close"
+    ]
+
+    for col in needed:
+
+        if col not in df.columns:
+            return None
+
+    df = (
+        df[needed]
+        .copy()
+        .dropna()
+    )
+
+    if len(df) < 60:
+        return None
+
+    return df
+
+
+# ============================================================
+# 6. 扫描一只股票
+#
+# 核心状态：
+#
+# 状态0：
+#   没有A
+#
+# 状态1：
+#   找到候选A
+#   A尚未锁定
+#
+#   此阶段继续创新高 -> A更新
+#
+# 状态2：
+#   A已经经历 >=8% 回撤
+#   并且价格真正离开顶部区域
+#
+#   A正式锁定
+#
+#   此后任何较低的小波峰都不能替换A
+#
+#   等待第一次重新攻击A
 # ============================================================
 
 def scan_symbol(symbol):
@@ -249,48 +408,21 @@ def scan_symbol(symbol):
             threads=False
         )
 
-        if df is None or len(df) < 60:
+        df = clean_dataframe(df)
+
+        if df is None:
+
             print(
                 f"[SKIP] {symbol}: "
-                f"Not enough data."
-            )
-            return None
-
-        # 兼容yfinance新版MultiIndex
-        if isinstance(
-            df.columns,
-            pd.MultiIndex
-        ):
-
-            df.columns = (
-                df.columns
-                .get_level_values(0)
+                f"no usable data"
             )
 
-        required_columns = [
-            "Open",
-            "High",
-            "Low",
-            "Close"
-        ]
-
-        for col in required_columns:
-
-            if col not in df.columns:
-                print(
-                    f"[SKIP] {symbol}: "
-                    f"Missing {col}."
-                )
-                return None
-
-        df = df.dropna(
-            subset=required_columns
-        ).copy()
-
-        if len(df) < 60:
             return None
 
         today_i = len(df) - 1
+
+        if today_i < 50:
+            return None
 
         today_high = float(
             df["High"].iloc[today_i]
@@ -304,279 +436,536 @@ def scan_symbol(symbol):
             df["Close"].iloc[today_i]
         )
 
-        today_date = df.index[today_i]
-
-        # ====================================================
-        # 寻找历史主波峰A
-        # ====================================================
-
-        earliest_a = max(
-            PIVOT_LEFT,
-            today_i - MAX_DAYS_AFTER_A
+        today_date = (
+            df.index[today_i]
         )
 
-        latest_a = (
-            today_i -
-            MIN_DAYS_AFTER_A
+        # ----------------------------------------------------
+        # 为了避免太古老的结构，
+        # 只从一定范围内开始寻找。
+        # ----------------------------------------------------
+
+        start_i = max(
+            PIVOT_LEFT + PIVOT_RIGHT,
+            today_i
+            -
+            MAX_DAYS_AFTER_A
+            -
+            A_CONTEXT_BARS
         )
 
-        if latest_a <= earliest_a:
+        # ----------------------------------------------------
+        # 状态变量
+        # ----------------------------------------------------
+
+        state = 0
+
+        a_i = None
+        a_price = None
+        a_date = None
+
+        lowest_since_a = None
+        c_i = None
+
+        away_days = 0
+
+        locked_pullback_pct = None
+
+        locked_c_price = None
+        locked_c_date = None
+
+        # ====================================================
+        # 一天一天模拟到“昨天”
+        #
+        # 今天不能用于建立历史结构。
+        # ====================================================
+
+        for j in range(
+            start_i,
+            today_i
+        ):
+
+            # ------------------------------------------------
+            # 已有结构太久 -> 放弃
+            # ------------------------------------------------
+
+            if (
+                a_i is not None
+                and
+                j - a_i
+                > MAX_DAYS_AFTER_A
+            ):
+
+                state = 0
+
+                a_i = None
+                a_price = None
+                a_date = None
+
+                lowest_since_a = None
+                c_i = None
+
+                away_days = 0
+
+                locked_pullback_pct = None
+                locked_c_price = None
+                locked_c_date = None
+
+            # =================================================
+            # 状态0：
+            # 没有A
+            # =================================================
+
+            if state == 0:
+
+                # pivot 要到右边几根K出现后才能确认
+                pivot_i = (
+                    j - PIVOT_RIGHT
+                )
+
+                if (
+                    pivot_i
+                    >= start_i
+                    and
+                    is_pivot_high(
+                        df,
+                        pivot_i
+                    )
+                    and
+                    is_major_high(
+                        df,
+                        pivot_i
+                    )
+                ):
+
+                    state = 1
+
+                    a_i = pivot_i
+
+                    a_price = float(
+                        df["High"]
+                        .iloc[pivot_i]
+                    )
+
+                    a_date = (
+                        df.index[pivot_i]
+                    )
+
+                    lowest_since_a = (
+                        a_price
+                    )
+
+                    c_i = pivot_i
+
+                    away_days = 0
+
+                continue
+
+            # =================================================
+            # 状态1：
+            # 有候选A，但是还没有真正形成大回撤
+            #
+            # 这时如果继续创新高：
+            #
+            # A必须更新。
+            #
+            # 这就是之前 AFL 等问题需要修正的地方。
+            # =================================================
+
+            if state == 1:
+
+                current_high = float(
+                    df["High"].iloc[j]
+                )
+
+                current_low = float(
+                    df["Low"].iloc[j]
+                )
+
+                # ------------------------------------------------
+                # C确认以前继续创新高：
+                # A更新为最新最高价。
+                # ------------------------------------------------
+
+                if current_high > a_price:
+
+                    a_i = j
+
+                    a_price = (
+                        current_high
+                    )
+
+                    a_date = (
+                        df.index[j]
+                    )
+
+                    lowest_since_a = (
+                        current_low
+                    )
+
+                    c_i = j
+
+                    away_days = 0
+
+                    continue
+
+                # ------------------------------------------------
+                # 更新A后的最低价
+                # ------------------------------------------------
+
+                if (
+                    lowest_since_a
+                    is None
+                    or
+                    current_low
+                    <
+                    lowest_since_a
+                ):
+
+                    lowest_since_a = (
+                        current_low
+                    )
+
+                    c_i = j
+
+                # ------------------------------------------------
+                # 当前最大回撤
+                # ------------------------------------------------
+
+                pullback_pct = (
+                    (
+                        a_price
+                        -
+                        lowest_since_a
+                    )
+                    /
+                    a_price
+                    *
+                    100
+                )
+
+                # ------------------------------------------------
+                # 前高区域下沿
+                # ------------------------------------------------
+
+                lower_band = (
+                    a_price
+                    *
+                    (
+                        1
+                        -
+                        RETEST_BELOW_PCT
+                        / 100
+                    )
+                )
+
+                # ------------------------------------------------
+                # 有多少天真正离开A附近
+                # ------------------------------------------------
+
+                if (
+                    current_high
+                    <
+                    lower_band
+                ):
+
+                    away_days += 1
+
+                # ------------------------------------------------
+                # 满足两个条件后：
+                #
+                # 1. 回撤 >= 8%
+                # 2. 至少离开顶部区域3天
+                #
+                # A正式锁定。
+                # ------------------------------------------------
+
+                if (
+                    pullback_pct
+                    >=
+                    MIN_PULLBACK_PCT
+                    and
+                    away_days
+                    >=
+                    MIN_DAYS_AWAY
+                ):
+
+                    state = 2
+
+                    locked_pullback_pct = (
+                        pullback_pct
+                    )
+
+                    locked_c_price = (
+                        lowest_since_a
+                    )
+
+                    locked_c_date = (
+                        df.index[c_i]
+                    )
+
+                continue
+
+            # =================================================
+            # 状态2：
+            #
+            # A已经锁定。
+            #
+            # 后面的小波峰不能再改变A。
+            #
+            # 如果历史上已经重新进入A附近，
+            # 说明这次机会早就发生过，
+            # 当前这轮结构结束。
+            # =================================================
+
+            if state == 2:
+
+                current_high = float(
+                    df["High"].iloc[j]
+                )
+
+                current_low = float(
+                    df["Low"].iloc[j]
+                )
+
+                # ------------------------------------------------
+                # C在真正重新冲击A以前仍允许继续向下延伸
+                # ------------------------------------------------
+
+                if (
+                    current_low
+                    <
+                    locked_c_price
+                ):
+
+                    locked_c_price = (
+                        current_low
+                    )
+
+                    locked_c_date = (
+                        df.index[j]
+                    )
+
+                    locked_pullback_pct = (
+                        (
+                            a_price
+                            -
+                            locked_c_price
+                        )
+                        /
+                        a_price
+                        *
+                        100
+                    )
+
+                lower_band = (
+                    a_price
+                    *
+                    (
+                        1
+                        -
+                        RETEST_BELOW_PCT
+                        / 100
+                    )
+                )
+
+                upper_band = (
+                    a_price
+                    *
+                    (
+                        1
+                        +
+                        RETEST_ABOVE_PCT
+                        / 100
+                    )
+                )
+
+                # ------------------------------------------------
+                # 历史上已经重新进入过前高区域
+                #
+                # 那么这套A已经被“测试”过，
+                # 今天不能再次拿它发第一次提醒。
+                # ------------------------------------------------
+
+                entered_zone = (
+                    current_high
+                    >=
+                    lower_band
+                    and
+                    current_low
+                    <=
+                    upper_band
+                )
+
+                if entered_zone:
+
+                    state = 0
+
+                    a_i = None
+                    a_price = None
+                    a_date = None
+
+                    lowest_since_a = None
+                    c_i = None
+
+                    away_days = 0
+
+                    locked_pullback_pct = None
+                    locked_c_price = None
+                    locked_c_date = None
+
+                continue
+
+        # ====================================================
+        # 历史模拟完成。
+        #
+        # 到昨天为止必须仍然存在一个：
+        #
+        # “已经锁定，但尚未重新测试”的A。
+        # ====================================================
+
+        if state != 2:
             return None
 
-        candidate_indices = list(
-            range(
-                earliest_a,
-                latest_a + 1
+        if a_i is None:
+            return None
+
+        bars_from_a = (
+            today_i - a_i
+        )
+
+        if (
+            bars_from_a
+            <
+            MIN_DAYS_AFTER_A
+        ):
+            return None
+
+        # ----------------------------------------------------
+        # 今天的A附近区域
+        # ----------------------------------------------------
+
+        lower_band = (
+            a_price
+            *
+            (
+                1
+                -
+                RETEST_BELOW_PCT
+                / 100
             )
         )
 
-        # 优先检查距离今天最近的有效A
-        candidate_indices.reverse()
-
-        for a_i in candidate_indices:
-
-            # --------------------------------------------
-            # A首先必须是一个历史波峰
-            # --------------------------------------------
-
-            if not is_pivot_high(
-                df["High"],
-                a_i
-            ):
-                continue
-
-            # --------------------------------------------
-            # A还必须是一个相对明显的高点
-            # --------------------------------------------
-
-            if not is_major_high(
-                df,
-                a_i
-            ):
-                continue
-
-            a_price = float(
-                df["High"].iloc[a_i]
+        upper_band = (
+            a_price
+            *
+            (
+                1
+                +
+                RETEST_ABOVE_PCT
+                / 100
             )
+        )
 
-            if a_price <= 0:
-                continue
+        # ====================================================
+        # 最重要的一步：
+        #
+        # 今天是否第一次重新进入历史前高区域？
+        #
+        # 用当天整根K线与区域是否相交判断。
+        #
+        # 因此普通上涨和跳空上涨都可以抓到。
+        # ====================================================
 
-            a_date = df.index[a_i]
+        today_enters_zone = (
+            today_high
+            >=
+            lower_band
+            and
+            today_low
+            <=
+            upper_band
+        )
 
-            # --------------------------------------------
-            # A以后到昨天
-            #
-            # 今天不参与历史回撤的计算
-            # --------------------------------------------
+        if not today_enters_zone:
+            return None
 
-            after_a = df.iloc[
-                a_i + 1:
-                today_i
-            ]
+        # ----------------------------------------------------
+        # 今天最高价距离A多少
+        # ----------------------------------------------------
 
-            if len(after_a) < 3:
-                continue
-
-            # --------------------------------------------
-            # 找A以后最深回撤C
-            # --------------------------------------------
-
-            c_price = float(
-                after_a["Low"].min()
-            )
-
-            c_date = (
-                after_a["Low"]
-                .idxmin()
-            )
-
-            pullback_pct = (
-                (a_price - c_price)
-                / a_price
-                * 100
-            )
-
-            # --------------------------------------------
-            # 中间回撤至少8%
-            # --------------------------------------------
-
-            if (
-                pullback_pct
-                < MIN_PULLBACK_PCT
-            ):
-                continue
-
-            # --------------------------------------------
-            # 定义重新冲击前高区域
-            # --------------------------------------------
-
-            lower_band = (
+        distance_pct = (
+            (
+                today_high
+                -
                 a_price
-                *
-                (
-                    1
-                    -
-                    RETEST_BELOW_PCT
-                    / 100
-                )
             )
+            /
+            a_price
+            *
+            100
+        )
 
-            upper_band = (
-                a_price
-                *
-                (
-                    1
-                    +
-                    RETEST_ABOVE_PCT
-                    / 100
-                )
-            )
+        print(
+            f"[MATCH] {symbol} | "
+            f"A={a_price:.2f} | "
+            f"Pullback="
+            f"{locked_pullback_pct:.2f}% | "
+            f"TodayHigh="
+            f"{today_high:.2f} | "
+            f"Distance="
+            f"{distance_pct:+.2f}%"
+        )
 
-            # --------------------------------------------
-            # 中间必须真正离开A附近
-            #
-            # 至少有MIN_DAYS_AWAY天
-            # 最高价都低于A区域下沿
-            # --------------------------------------------
+        return {
+            "symbol":
+                symbol,
 
-            away_days = int(
-                (
-                    after_a["High"]
-                    < lower_band
-                ).sum()
-            )
+            "today_date":
+                str(
+                    today_date.date()
+                ),
 
-            if away_days < MIN_DAYS_AWAY:
-                continue
+            "a_date":
+                str(
+                    a_date.date()
+                ),
 
-            # --------------------------------------------
-            # 今天重新进入前高A附近
-            #
-            # 使用整根K是否与A区域相交
-            #
-            # 可以识别普通上涨和跳空上涨
-            # --------------------------------------------
+            "a_price":
+                a_price,
 
-            today_enters_zone = (
-                today_high >= lower_band
-                and
-                today_low <= upper_band
-            )
+            "c_date":
+                str(
+                    locked_c_date.date()
+                ),
 
-            if not today_enters_zone:
-                continue
+            "c_price":
+                locked_c_price,
 
-            # --------------------------------------------
-            # 昨天不能已经在这个区域
-            #
-            # 我们希望尽量在“首次重新进入”时提醒
-            # --------------------------------------------
+            "pullback_pct":
+                locked_pullback_pct,
 
-            yesterday_high = float(
-                df["High"]
-                .iloc[today_i - 1]
-            )
+            "today_high":
+                today_high,
 
-            yesterday_low = float(
-                df["Low"]
-                .iloc[today_i - 1]
-            )
+            "today_close":
+                today_close,
 
-            yesterday_in_zone = (
-                yesterday_high
-                >= lower_band
-                and
-                yesterday_low
-                <= upper_band
-            )
+            "distance_pct":
+                distance_pct,
 
-            if yesterday_in_zone:
-                continue
+            "bars_from_a":
+                bars_from_a,
 
-            # --------------------------------------------
-            # 如果昨天已经完全突破A区域上方，
-            # 今天就不是从下方重新冲击
-            # --------------------------------------------
+            "zone_low":
+                lower_band,
 
-            if (
-                yesterday_high
-                > upper_band
-            ):
-                continue
+            "zone_high":
+                upper_band,
 
-            # --------------------------------------------
-            # 今天最高价距离A多少
-            # --------------------------------------------
-
-            distance_pct = (
-                (today_high - a_price)
-                / a_price
-                * 100
-            )
-
-            bars_from_a = (
-                today_i - a_i
-            )
-
-            print(
-                f"[MATCH] {symbol} | "
-                f"A={a_price:.2f} | "
-                f"Pullback={pullback_pct:.2f}% | "
-                f"TodayHigh={today_high:.2f} | "
-                f"Distance={distance_pct:+.2f}%"
-            )
-
-            return {
-                "symbol": symbol,
-
-                "today_date":
-                    str(
-                        today_date.date()
-                    ),
-
-                "a_date":
-                    str(
-                        a_date.date()
-                    ),
-
-                "a_price":
-                    a_price,
-
-                "c_date":
-                    str(
-                        c_date.date()
-                    ),
-
-                "c_price":
-                    c_price,
-
-                "pullback_pct":
-                    pullback_pct,
-
-                "today_high":
-                    today_high,
-
-                "today_close":
-                    today_close,
-
-                "distance_pct":
-                    distance_pct,
-
-                "bars_from_a":
-                    bars_from_a,
-
-                "zone_low":
-                    lower_band,
-
-                "zone_high":
-                    upper_band,
-
-                "away_days":
-                    away_days,
-            }
-
-        return None
+            "away_days":
+                away_days,
+        }
 
     except Exception as exc:
 
@@ -590,13 +979,13 @@ def scan_symbol(symbol):
 
 
 # ============================================================
-# 6. 批量扫描 Nasdaq-100
+# 7. 批量扫描 Nasdaq-100
 # ============================================================
 
 def run_scan():
 
     symbols = (
-        get_nasdaq100_symbols()
+        NASDAQ100_SYMBOLS
     )
 
     print("")
@@ -605,7 +994,11 @@ def run_scan():
     )
 
     print(
-        f"Nasdaq-100 symbols: "
+        "Nasdaq-100 retest scanner"
+    )
+
+    print(
+        f"Symbols to scan: "
         f"{len(symbols)}"
     )
 
@@ -630,6 +1023,7 @@ def run_scan():
         )
 
         if result is not None:
+
             results.append(
                 result
             )
@@ -638,7 +1032,7 @@ def run_scan():
 
 
 # ============================================================
-# 7. 生成邮件正文
+# 8. 生成邮件
 # ============================================================
 
 def build_email(results):
@@ -647,47 +1041,58 @@ def build_email(results):
         "%Y-%m-%d"
     )
 
-    # ========================================================
-    # 今天没有候选
-    # ========================================================
+    # --------------------------------------------------------
+    # 没有候选
+    # --------------------------------------------------------
 
     if not results:
 
         subject = (
-            f"Nasdaq-100 前高再次冲击扫描 "
+            "Nasdaq-100 前高再次冲击扫描 "
             f"{today}：无候选"
         )
 
         body = (
             f"{today}\n\n"
-            "今天 Nasdaq-100 没有发现符合"
-            "“明显回撤后再次冲击前高”"
-            "价格结构的股票。\n\n"
-            "当前主要筛选条件：\n"
-            f"1. 中间回撤 >= "
+
+            "今天 Nasdaq-100 没有发现符合条件的"
+            "“明显回撤后再次冲击历史前高”股票。\n\n"
+
+            "当前条件：\n"
+
+            f"历史前高后至少回撤："
             f"{MIN_PULLBACK_PCT:.1f}%\n"
-            f"2. 前高区域下方容差 "
-            f"{RETEST_BELOW_PCT:.1f}%\n"
-            f"3. 前高区域上方容差 "
-            f"{RETEST_ABOVE_PCT:.1f}%\n"
-            f"4. 至少离开前高区域 "
+
+            f"至少明显离开前高区域："
             f"{MIN_DAYS_AWAY} 个交易日\n"
+
+            f"再次冲击区域："
+            f"A下方 {RETEST_BELOW_PCT:.1f}% "
+            f"至 A上方 {RETEST_ABOVE_PCT:.1f}%\n\n"
+
+            "没有候选也会发送本邮件，"
+            "用于确认自动扫描器每天正常运行。"
         )
 
-        return subject, body
+        return (
+            subject,
+            body
+        )
 
-    # ========================================================
+    # --------------------------------------------------------
     # 有候选
-    # ========================================================
+    # --------------------------------------------------------
 
     results = sorted(
         results,
         key=lambda x:
-        abs(x["distance_pct"])
+        abs(
+            x["distance_pct"]
+        )
     )
 
     subject = (
-        f"Nasdaq-100 前高再次冲击提醒 "
+        "Nasdaq-100 前高再次冲击提醒 "
         f"{today}："
         f"{len(results)} 只"
     )
@@ -696,21 +1101,27 @@ def build_email(results):
 
     lines.append(
         f"{today} Nasdaq-100 "
-        f"前高再次冲击扫描结果"
+        f"扫描结果"
     )
 
     lines.append("")
 
     lines.append(
-        "以下股票在经历明显回撤后，"
-        "今天重新进入历史主波峰附近。"
+        "以下股票在经历明显回撤以后，"
+        "今天第一次重新进入历史前高附近。"
     )
 
     lines.append("")
 
     lines.append(
-        "这只是价格结构初筛，"
-        "需要你再打开图表人工判断。"
+        "请打开日K图进行人工判断。"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "本邮件只是价格结构筛选，"
+        "不是交易建议。"
     )
 
     lines.append("")
@@ -722,35 +1133,36 @@ def build_email(results):
         )
 
         lines.append(
-            f"股票：{r['symbol']}"
+            f"股票："
+            f"{r['symbol']}"
         )
+
+        lines.append("")
 
         lines.append(
             f"最新交易日："
             f"{r['today_date']}"
         )
 
-        lines.append("")
-
         lines.append(
-            f"历史前高 A 日期："
+            f"历史前高A日期："
             f"{r['a_date']}"
         )
 
         lines.append(
-            f"历史前高 A："
+            f"历史前高A："
             f"{r['a_price']:.2f}"
         )
 
         lines.append("")
 
         lines.append(
-            f"中间最低点 C 日期："
+            f"中间最低点C日期："
             f"{r['c_date']}"
         )
 
         lines.append(
-            f"中间最低点 C："
+            f"中间最低点C："
             f"{r['c_price']:.2f}"
         )
 
@@ -772,27 +1184,23 @@ def build_email(results):
         )
 
         lines.append(
-            f"今天最高价相对前高A："
+            f"今天最高价相对A："
             f"{r['distance_pct']:+.2f}%"
         )
 
         lines.append("")
 
         lines.append(
-            f"当前前高观察区域："
+            f"当前前高观察区："
             f"{r['zone_low']:.2f}"
-            f" ~ "
+            " ~ "
             f"{r['zone_high']:.2f}"
         )
 
         lines.append(
             f"A距今天："
-            f"{r['bars_from_a']} 根日K"
-        )
-
-        lines.append(
-            f"中间明显离开前高区域："
-            f"{r['away_days']} 天"
+            f"{r['bars_from_a']} "
+            f"根日K"
         )
 
         lines.append("")
@@ -804,7 +1212,7 @@ def build_email(results):
 
 
 # ============================================================
-# 8. 发送QQ邮箱提醒
+# 9. QQ邮箱发送
 # ============================================================
 
 def send_email(
@@ -863,38 +1271,38 @@ def send_email(
             ", ".join(missing)
         )
 
-    try:
-        smtp_port = int(
-            smtp_port_text
-        )
+    smtp_port = int(
+        smtp_port_text
+    )
 
-    except ValueError:
-
-        raise RuntimeError(
-            "SMTP_PORT must be "
-            "a number."
-        )
-
-    msg = MIMEText(
+    message = MIMEText(
         body,
         "plain",
         "utf-8"
     )
 
-    msg["Subject"] = Header(
+    message["Subject"] = Header(
         subject,
         "utf-8"
     )
 
-    msg["From"] = smtp_user
-    msg["To"] = email_to
+    message["From"] = (
+        smtp_user
+    )
+
+    message["To"] = (
+        email_to
+    )
 
     print("")
     print(
-        "Connecting to SMTP server..."
+        "Connecting to email server..."
     )
 
+    # --------------------------------------------------------
     # QQ邮箱465端口
+    # --------------------------------------------------------
+
     if smtp_port == 465:
 
         with smtplib.SMTP_SSL(
@@ -911,10 +1319,13 @@ def send_email(
             server.sendmail(
                 smtp_user,
                 [email_to],
-                msg.as_string()
+                message.as_string()
             )
 
-    # 如果以后改用587
+    # --------------------------------------------------------
+    # 兼容587端口
+    # --------------------------------------------------------
+
     else:
 
         with smtplib.SMTP(
@@ -924,7 +1335,9 @@ def send_email(
         ) as server:
 
             server.ehlo()
+
             server.starttls()
+
             server.ehlo()
 
             server.login(
@@ -935,7 +1348,7 @@ def send_email(
             server.sendmail(
                 smtp_user,
                 [email_to],
-                msg.as_string()
+                message.as_string()
             )
 
     print(
@@ -944,7 +1357,7 @@ def send_email(
 
 
 # ============================================================
-# 9. 主程序
+# 10. 主程序
 # ============================================================
 
 if __name__ == "__main__":
@@ -954,9 +1367,9 @@ if __name__ == "__main__":
         "retest scanner..."
     )
 
-    print("")
-
-    results = run_scan()
+    results = (
+        run_scan()
+    )
 
     print("")
     print(
@@ -979,7 +1392,8 @@ if __name__ == "__main__":
 
             print(
                 r["symbol"],
-                f"| A={r['a_price']:.2f}",
+                f"| A="
+                f"{r['a_price']:.2f}",
                 f"| Pullback="
                 f"{r['pullback_pct']:.2f}%",
                 f"| TodayHigh="
