@@ -4,30 +4,48 @@ on:
   workflow_dispatch:
 
   schedule:
-    # 每周一到周五 22:30 UTC
-    # 美国无论夏令时还是冬令时，都已经收盘
-    # 北京/上海时间次日早上 06:30 左右运行
-    - cron: "30 22 * * 1-5"
+    # 美国夏令时：15:30 ET = 19:30 UTC
+    - cron: "30 19 * * 1-5"
+
+    # 美国冬令时：15:30 ET = 20:30 UTC
+    - cron: "30 20 * * 1-5"
 
 jobs:
   scan:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Check New York time
+        id: market_time
+        run: |
+          NY_HOUR=$(TZ=America/New_York date +%H)
+
+          echo "Current New York hour: $NY_HOUR"
+
+          if [ "$NY_HOUR" = "15" ]; then
+            echo "run_scan=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_scan=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.market_time.outputs.run_scan == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: steps.market_time.outputs.run_scan == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
+        if: steps.market_time.outputs.run_scan == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run Nasdaq-100 scanner
+        if: steps.market_time.outputs.run_scan == 'true'
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
